@@ -1,0 +1,178 @@
+import json
+import os
+import asyncio
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.enums import ContentType
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import StateFilter
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+API_TOKEN = '7679712644:AAH9n2-tGOYnATUqk7eTKDj0UfmsG4sOSmk'
+ADMIN_ID = 6246062168
+USERS_FILE = 'users.json'
+GROUPS = ["Руководящий состав🧑‍💼", "КЧС🌪️", "Сотрудники ЕДДС🧑‍💻"]
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+# --- Состояния ---
+class BroadcastStates(StatesGroup):
+    await_broadcast = State()
+
+class ReplyToAdminStates(StatesGroup):
+    waiting_for_reply = State()
+
+# --- Хранилище пользователей ---
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return {}
+    with open(USERS_FILE, 'r') as f:
+        return json.load(f)
+
+def save_users(users):
+    with open(USERS_FILE, 'w') as f:
+        json.dump(users, f)
+
+def register_user(user_id):
+    users = load_users()
+    if str(user_id) not in users:
+        users[str(user_id)] = None
+        save_users(users)
+
+def set_user_group(user_id, group):
+    users = load_users()
+    users[str(user_id)] = group
+    save_users(users)
+
+def get_user_group(user_id):
+    return load_users().get(str(user_id))
+
+def get_users_by_group(group):
+    return [int(uid) for uid, g in load_users().items() if g == group]
+
+# --- Команды ---
+@dp.message(F.text == "/start")
+async def start(message: Message):
+    register_user(message.from_user.id)
+    await message.answer("Вы зарегистрированы✅. Ожидайте, пока администратор добавит вас в группу.")
+
+@dp.message(F.text == "/mygroup")
+async def my_group(message: Message):
+    group = get_user_group(message.from_user.id)
+    if group:
+        await message.answer(f"Ваша группа: {group}")
+    else:
+        await message.answer("Вы ещё не добавлены в группу.")
+
+@dp.message(F.text == "/users")
+async def list_users(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    users = load_users()
+    for uid, group in users.items():
+        group_text = group if group else "Без группы"
+        try:
+            user = await bot.get_chat(int(uid))
+            name = f"{user.full_name} (@{user.username})" if user.username else user.full_name
+        except:
+            name = f"Не удалось получить имя (ID: {uid})"
+
+        keyboard = InlineKeyboardBuilder()
+        for idx, g in enumerate(GROUPS):
+            keyboard.button(text=f"Добавить в '{g}'", callback_data=f"addgroup:{uid}:{idx}")
+        keyboard.button(text="❌ Удалить из группы", callback_data=f"removegroup:{uid}")
+        keyboard.adjust(1)
+
+        await message.answer(f"👤 Пользователь: {name}\n📌 Группа: {group_text}", reply_markup=keyboard.as_markup())
+
+@dp.callback_query(F.data.startswith("addgroup:"))
+async def add_group_callback(callback: CallbackQuery):
+    _, uid, group_index = callback.data.split(":")
+    group = GROUPS[int(group_index)]
+    set_user_group(uid, group)
+    await callback.answer("Группа обновлена")
+    await callback.message.answer(f"Пользователь {uid} добавлен в группу: {group}")
+
+@dp.callback_query(F.data.startswith("removegroup:"))
+async def remove_group_callback(callback: CallbackQuery):
+    uid = callback.data.split(":")[1]
+    set_user_group(uid, None)
+    await callback.answer("Пользователь удалён из группы")
+    await callback.message.answer(f"Пользователь {uid} удалён из группы")
+
+@dp.message(F.text == "/broadcast")
+async def broadcast_menu(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    keyboard = InlineKeyboardBuilder()
+    for group in GROUPS:
+        keyboard.button(text=group, callback_data=f"broadcast:{group}")
+    keyboard.adjust(1)
+    await message.answer("Выберите группу для рассылки:", reply_markup=keyboard.as_markup())
+
+@dp.callback_query(F.data.startswith("broadcast:"))
+async def broadcast_choose(callback: CallbackQuery, state: FSMContext):
+    group = callback.data.split(":")[1]
+    await state.set_data({"group": group})
+    await callback.message.answer(f"Пришлите сообщение или медиа для рассылки в группу: {group}")
+    await state.set_state(BroadcastStates.await_broadcast)
+    await callback.answer()
+
+@dp.message(StateFilter(BroadcastStates.await_broadcast))
+async def handle_broadcast_content(message: Message, state: FSMContext):
+    data = await state.get_data()
+    group = data.get("group")
+    user_ids = get_users_by_group(group)
+    success = 0
+
+    reply_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Не смогу присутствовать", callback_data="reply_admin")]
+    ])
+
+    for uid in user_ids:
+        try:
+            if message.text:
+                await bot.send_message(uid, message.text, reply_markup=reply_keyboard)
+            elif message.photo:
+                await bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption, reply_markup=reply_keyboard)
+            elif message.video:
+                await bot.send_video(uid, message.video.file_id, caption=message.caption, reply_markup=reply_keyboard)
+            elif message.document:
+                await bot.send_document(uid, message.document.file_id, caption=message.caption, reply_markup=reply_keyboard)
+            success += 1
+        except:
+            continue
+
+    await message.answer(f"Рассылка завершена. Успешно: {success}/{len(user_ids)}")
+    await state.clear()
+
+@dp.callback_query(F.data == "reply_admin")
+async def start_reply(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ReplyToAdminStates.waiting_for_reply)
+    await state.set_data({"from_user": callback.from_user.id})
+    await callback.message.answer("✍️ Напишите сообщение, которое будет отправлено администратору.")
+    await callback.answer()
+
+@dp.message(StateFilter(ReplyToAdminStates.waiting_for_reply))
+async def send_reply_to_admin(message: Message, state: FSMContext):
+    data = await state.get_data()
+    from_user_id = data.get("from_user")
+    try:
+        user = await bot.get_chat(from_user_id)
+        sender = f"{user.full_name} (@{user.username})" if user.username else user.full_name
+    except:
+        sender = f"ID: {from_user_id}"
+
+    await bot.send_message(ADMIN_ID, f"📩 Ответ от пользователя {sender}:\n{message.text}")
+    await message.answer("✅ Ваше сообщение отправлено администратору.")
+    await state.clear()
+
+# --- Запуск ---
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
